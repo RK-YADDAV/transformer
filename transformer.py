@@ -1,4 +1,5 @@
 import math
+from random import random
 
 class Tensor:
     def __init__(self, data, shape=None):
@@ -160,7 +161,7 @@ class Module:
 class Linear(Module):
     def __init__(self, in_features, out_features):
         self.weight = Tensor([
-            [0.01 for _ in range(out_features)]
+            [random.gauss(0.0, 0.02) for _ in range(out_features)]
             for _ in range(in_features)
         ])
 
@@ -172,10 +173,11 @@ class Linear(Module):
         return (x @ self.weight) + self.bias
 
 
+
 class Embedding(Module):
     def __init__(self, vocab_size, embedding_dim):
         self.weight = Tensor([
-            [(i + 1) * 0.01 for _ in range(embedding_dim)]
+            [random.gauss(0.0, 0.02) for _ in range(embedding_dim)]
             for i in range(vocab_size)
         ])
 
