@@ -589,67 +589,327 @@ def generate(model, input_tokens, max_new_tokens):
 
     return input_tokens
     
+def measure_latency(model, seq_len, runs=10):
+    # Create a sequence of the required length
+    input_tokens = [i % 50 for i in range(seq_len)]
+
+    # Warm-up runs
+    for _ in range(2):
+        model(input_tokens)
+
+    times = []
+
+    for _ in range(runs):
+        start = time.perf_counter()
+
+        model(input_tokens)
+
+        end = time.perf_counter()
+
+        times.append((end - start) * 1000)  # milliseconds
+
+    average_latency = sum(times) / len(times)
+
+    return average_latency
+    
+    
+def test_future_token_gradient_leakage():
+    print("\nFuture-Token Gradient Leakage Test")
+    print("=" * 50)
+
+    # Use a small attention module
+    embed_dim = 4
+    head_dim = 4
+    seq_len = 4
+
+    attn = SelfAttention(embed_dim, head_dim)
+
+    # ------------------------------------------------------------
+    # Give the attention weights non-identical values.
+    # This makes the gradient test meaningful.
+    # ------------------------------------------------------------
+    params = get_parameters(attn)
+
+    for i, p in enumerate(params):
+        p.data = 0.01 * (i + 1)
+
+    # Deliberately non-uniform input
+    input_data = [
+        [0.2, -0.1, 0.3, 0.7],
+        [0.5,  0.4, -0.2, 0.1],
+        [-0.3, 0.8, 0.6, -0.5],
+        [0.9, -0.7, 0.2, 0.4]
+    ]
+
+    maximum_future_gradient = 0.0
+
+    # Test every output position
+    for i in range(seq_len):
+
+        # Fresh input graph for this test
+        x = Tensor(input_data)
+
+        # Forward
+        output = attn(x)
+
+        # Select ONE scalar from output position i
+        idx = i * head_dim
+
+        loss = output.data[idx]
+
+        # Backward
+        loss.backward()
+
+        # Check gradients of future input positions
+        future_gradients = []
+
+        for j in range(i + 1, seq_len):
+
+            start = j * embed_dim
+            end = start + embed_dim
+
+            grads = [
+                abs(v.grad)
+                for v in x.data[start:end]
+            ]
+
+            future_gradients.extend(grads)
+
+        if future_gradients:
+            future_max = max(future_gradients)
+        else:
+            future_max = 0.0
+
+        maximum_future_gradient = max(
+            maximum_future_gradient,
+            future_max
+        )
+
+        print(
+            f"Output position {i} | "
+            f"Maximum future-token gradient: {future_max:.12f}"
+        )
+
+    print("=" * 50)
+
+    print(
+        f"Maximum gradient leakage observed: "
+        f"{maximum_future_gradient:.12f}"
+    )
+
+    if maximum_future_gradient == 0.0:
+        print("PASS: Future-token gradient leakage = exactly 0.0")
+    else:
+        print("FAIL: Future-token gradient leakage detected!")
+    
+    
+    
+    
+    
 if __name__ == "__main__":
-    # Create model
+
+    # ============================================================
+    # CONFIGURATION
+    # ============================================================
+
+    vocab_size = 50
+    max_seq_len = 10
+    learning_rate = 0.01
+
+    # ============================================================
+    # ASK FOR INPUT BEFORE TRAINING
+    # ============================================================
+
+    print("=" * 50)
+    print("TRANSFORMER ENGINE")
+    print("=" * 50)
+
+    try:
+        raw_input_seq = input(
+            "Enter input token IDs separated by commas "
+            "(e.g. 5,11,15): "
+        )
+
+        parts = raw_input_seq.split(",")
+
+        if not raw_input_seq.strip() or any(
+            not part.strip() for part in parts
+        ):
+            raise ValueError("Input sequence cannot be empty.")
+
+        input_seq = [int(part.strip()) for part in parts]
+
+        if any(token < 0 or token >= vocab_size for token in input_seq):
+            raise ValueError("Token IDs must be between 0 and 49.")
+
+        if len(input_seq) >= max_seq_len:
+            raise ValueError(
+                "Input sequence must have fewer than 10 tokens "
+                "to generate at least one new token."
+            )
+
+        target_token = int(
+            input(
+                "Enter the expected next token ID (0-49): "
+            )
+        )
+
+        if not 0 <= target_token < vocab_size:
+            raise ValueError(
+                "Target token must be between 0 and 49."
+            )
+
+        epochs = int(
+            input("Enter number of training iterations: ")
+        )
+
+        if epochs < 1:
+            raise ValueError(
+                "Training iterations must be at least 1."
+            )
+
+    except ValueError as error:
+        print("Invalid input:", error)
+        raise SystemExit(1)
+
+    # ============================================================
+    # CREATE MODEL
+    # ============================================================
+
     model = Transformer(
-        vocab_size=50,
-        max_seq_len=10,
+        vocab_size=vocab_size,
+        max_seq_len=max_seq_len,
         embed_dim=16,
         num_heads=2,
         head_dim=8,
         num_layers=2
     )
 
-    learning_rate = 0.01
-
     params = get_parameters(model)
 
-    # Simple dataset
-    input_seq = [5, 10, 15]
-    target_token = 20
+    # ============================================================
+    # TRAIN ON THE USER-PROVIDED EXAMPLE
+    # ============================================================
 
-    # Training
-    for epoch in range(10):
+    print("\nTraining started...")
+    print("Training input:", input_seq)
+    print("Expected next token:", target_token)
 
-        # Forward
+    for epoch in range(epochs):
+
+        # Forward pass
         logits = model(input_seq)
 
-        # Extract last row
+        # Extract logits from the final input position
         rows, cols = logits.shape
         start = (rows - 1) * cols
         last_row = logits.data[start:start + cols]
 
-        # Probabilities
+        # Convert final-position logits into probabilities
         probs = Softmax().forward(
-            Tensor([last_row])  # <-- Add brackets here to make it 2D!
+            Tensor([last_row])
         ).data
 
-        # Loss
+        # Calculate loss for the user's target token
         p_target = probs[target_token]
-        loss = -p_target.log()
+        # Add 1e-8 to prevent math.log(0.0) crashes
+        loss = -(p_target + 1e-8).log()
 
-        # Backward
+        # Save the loss value before updating parameters
+        loss_value = loss.data
+
+        # Backward pass
         loss.backward()
 
-        # Update parameters
+        # Gradient-descent parameter update
         for p in params:
             p.data -= learning_rate * p.grad
 
-        # Zero gradients
+        # Reset gradients for the next iteration
         for p in params:
             p.grad = 0.0
 
-        # Print
-        print(f"Epoch {epoch} | Loss: {loss.data:.4f}")
-        
-        
-# --- Add this at the very bottom, outside the training loop ---
+        print(
+            f"Iteration {epoch + 1}/{epochs} "
+            f"| Loss: {loss_value:.8f}"
+        )
+
+    # ============================================================
+    # GENERATE AFTER TRAINING
+    # ============================================================
+
     print("\nTraining complete! Testing the model...")
+
+    # Preserve the user's original input
+    original_input = input_seq.copy()
+
+    # Generate one new token
+    final_output = generate(
+        model,
+        original_input.copy(),
+        max_new_tokens=1
+    )
+
+    # Extract only the newly predicted token(s)
+    predicted_tokens = final_output[len(original_input):]
+
+    # ============================================================
+    # DISPLAY RESULTS
+    # ============================================================
+
+    print("\n" + "=" * 50)
+    print("RESULT")
+    print("=" * 50)
+
+    print("Input sequence:          ", original_input)
+    print("Expected next token:     ", target_token)
+    print("Model predicted token:   ", predicted_tokens[0])
+    print("Complete output sequence:", final_output)
+
+    print("=" * 50)
+
+    # ============================================================
+    # LATENCY BENCHMARK
+    # ============================================================
+
+    print("\nLatency Benchmark")
+
+    for seq_len in [1, 2, 4, 8]:
+
+        latency = measure_latency(
+            model,
+            seq_len,
+            runs=10
+        )
+
+        print(
+            f"Sequence Length: {seq_len:2d} | "
+            f"Average Latency: {latency:.2f} ms"
+        )
+
+
+    # ============================================================
+    # CALCULATE 1 -> 8 RATIO
+    # ============================================================
+
+    latency_1 = measure_latency(
+        model,
+        seq_len=1,
+        runs=10
+    )
+
+    latency_8 = measure_latency(
+        model,
+        seq_len=8,
+        runs=10
+    )
+
+    ratio = latency_8 / latency_1
+
+    print(
+        f"\nLatency ratio (1 → 8 tokens): {ratio:.2f}x"
+    )
     
-    # Give it the starting sequence
-    test_seq = [5, 10, 15]
     
-    # Ask it to generate 1 new token using its newly trained weights
-    final_output = generate(model, test_seq, max_new_tokens=1)
     
-    print(f"Generated sequence: {final_output}")
+test_future_token_gradient_leakage()
